@@ -156,6 +156,10 @@ type PendingSalesDates = {
   firstRun: boolean;
 };
 
+type RunOptions = {
+  commitState: boolean;
+};
+
 type RunReport = {
   projectName: string;
   appId: string;
@@ -193,13 +197,14 @@ export default {
     }
 
     const shouldPost = url.searchParams.get("post") !== "false";
+    const commitState = shouldPost || url.searchParams.get("commit") === "true";
 
     try {
-      const report = await buildReport(env);
+      const report = await buildReport(env, { commitState });
       if (shouldPost) {
         await postDiscordReport(env, report);
       }
-      return jsonResponse({ ok: true, posted: shouldPost, report });
+      return jsonResponse({ ok: true, posted: shouldPost, stateCommitted: commitState, report });
     } catch (error) {
       return jsonResponse({ ok: false, error: errorToMessage(error) }, 500);
     }
@@ -215,7 +220,7 @@ async function runScheduled(env: Env): Promise<void> {
 }
 
 async function runAndPost(env: Env): Promise<void> {
-  const report = await buildReport(env);
+  const report = await buildReport(env, { commitState: true });
   const shouldPost =
     parseBool(configValue(env, "SEND_EMPTY_REPORTS", "REPORT_ON_ZERO_ACTIVITY"), true) ||
     hasActivity(report) ||
@@ -229,7 +234,7 @@ async function runAndPost(env: Env): Promise<void> {
   await postDiscordReport(env, report);
 }
 
-async function buildReport(env: Env): Promise<RunReport> {
+async function buildReport(env: Env, options: RunOptions): Promise<RunReport> {
   const appId = requireEnv(env.STEAM_APP_ID, "STEAM_APP_ID");
   const projectName = requireEnv(configValue(env, "PROJECT_DISPLAY_NAME", "STEAM_PROJECT_NAME"), "PROJECT_DISPLAY_NAME");
   requireEnv(env.STEAM_FINANCIAL_API_KEY, "STEAM_FINANCIAL_API_KEY");
@@ -247,7 +252,7 @@ async function buildReport(env: Env): Promise<RunReport> {
   };
 
   if (parseBool(env.ENABLE_WISHLIST_REPORTING, true)) {
-    const wishlistResult = await buildWishlistDelta(env, appId);
+    const wishlistResult = await buildWishlistDelta(env, appId, options);
     report.wishlist = wishlistResult.delta;
     report.totals = {
       ...report.totals,
@@ -264,7 +269,7 @@ async function buildReport(env: Env): Promise<RunReport> {
   }
 
   if (parseBool(env.ENABLE_SALES_REPORTING, true)) {
-    const salesResult = await buildSalesDelta(env, appId);
+    const salesResult = await buildSalesDelta(env, appId, options);
     report.sales = salesResult.delta;
     report.totals = {
       ...report.totals,
@@ -283,6 +288,7 @@ async function buildReport(env: Env): Promise<RunReport> {
 async function buildWishlistDelta(
   env: Env,
   appId: string,
+  options: RunOptions,
 ): Promise<{ delta: WishlistSnapshot; totals: ReportTotals; baselineInitialized: boolean; notes: string[] }> {
   const dates = uniqueStrings([getUtcDateString(0), getUtcDateString(-1)]);
   const totalDelta = emptyWishlistSnapshot();
@@ -298,23 +304,30 @@ async function buildWishlistDelta(
     const stateKey = `wishlist:${appId}:${date}`;
     const previous = await getJson<WishlistSnapshot>(env, stateKey);
     fetchedSnapshots.set(fetched.date, { current, previous });
-    baselineInitialized ||= previous == null;
+    baselineInitialized ||= options.commitState && previous == null;
 
     const baseline = previous ?? current;
     const delta = diffWishlistSnapshots(current, baseline);
     mergeWishlistSnapshot(totalDelta, delta);
 
-    await putJson(env, stateKey, current);
+    if (options.commitState) {
+      await putJson(env, stateKey, current);
+    }
   }
 
-  const totals = await buildWishlistTotals(env, appId, appMinDate, fetchedSnapshots);
+  const totals = await buildWishlistTotals(env, appId, appMinDate, fetchedSnapshots, options);
 
   if (baselineInitialized) {
     notes.push("Wishlist baseline initialized. Existing wishlist reporting totals were not posted.");
   }
 
+  if (!options.commitState) {
+    notes.push("Dry run only. KV state was not changed; totals are a preview.");
+  }
+
   if (!totals.wishlistBackfillComplete) {
-    notes.push(`Wishlist total backfill in progress. Totals currently include ${totals.wishlistKnownDays} known reporting day${totals.wishlistKnownDays === 1 ? "" : "s"}.`);
+    const prefix = options.commitState ? "Wishlist total backfill in progress." : "Wishlist total backfill preview.";
+    notes.push(`${prefix} Totals currently include ${totals.wishlistKnownDays} known reporting day${totals.wishlistKnownDays === 1 ? "" : "s"}.`);
   }
 
   return { delta: totalDelta, totals, baselineInitialized, notes };
@@ -368,7 +381,11 @@ async function fetchWishlistSnapshot(env: Env, appId: string, date: string): Pro
   };
 }
 
-async function buildSalesDelta(env: Env, appId: string): Promise<{ delta: SalesSnapshot; totals: ReportTotals; baselineInitialized: boolean; notes: string[] }> {
+async function buildSalesDelta(
+  env: Env,
+  appId: string,
+  options: RunOptions,
+): Promise<{ delta: SalesSnapshot; totals: ReportTotals; baselineInitialized: boolean; notes: string[] }> {
   const highwatermarkKey = `sales:changed_dates_highwatermark:${appId}`;
   const pendingKey = `sales:pending_changed_dates:${appId}`;
   const storedHighwatermark = await env.STEAM_REPORTER_STATE.get(highwatermarkKey);
@@ -391,7 +408,11 @@ async function buildSalesDelta(env: Env, appId: string): Promise<{ delta: SalesS
   }
 
   if (dates.length === 0) {
-    await env.STEAM_REPORTER_STATE.put(highwatermarkKey, newHighwatermark);
+    if (options.commitState) {
+      await env.STEAM_REPORTER_STATE.put(highwatermarkKey, newHighwatermark);
+    } else {
+      notes.push("Dry run only. KV state was not changed; sales highwatermark was not updated.");
+    }
     notes.push("No changed sales dates reported by Steam.");
     return { delta: totalDelta, totals: await buildSalesTotals(env, appId), baselineInitialized: false, notes };
   }
@@ -407,31 +428,43 @@ async function buildSalesDelta(env: Env, appId: string): Promise<{ delta: SalesS
     applySalesSnapshotToTotals(salesTotals, current, previous);
 
     if (isFirstRun && baselineOnFirstRun) {
-      await putJson(env, stateKey, current);
+      if (options.commitState) {
+        await putJson(env, stateKey, current);
+      }
       continue;
     }
 
     const baseline = previous ?? emptySalesSnapshot();
     const delta = diffSalesSnapshots(current, baseline);
     mergeSalesSnapshot(totalDelta, delta);
-    await putJson(env, stateKey, current);
+    if (options.commitState) {
+      await putJson(env, stateKey, current);
+    }
   }
 
-  await putJson(env, `sales:totals:${appId}`, salesTotals);
+  if (options.commitState) {
+    await putJson(env, `sales:totals:${appId}`, salesTotals);
+  }
 
   if (remainingDates.length > 0) {
-    await putJson(env, pendingKey, {
-      dates: remainingDates,
-      resultHighwatermark: newHighwatermark,
-      firstRun: isFirstRun,
-    } satisfies PendingSalesDates);
+    if (options.commitState) {
+      await putJson(env, pendingKey, {
+        dates: remainingDates,
+        resultHighwatermark: newHighwatermark,
+        firstRun: isFirstRun,
+      } satisfies PendingSalesDates);
+    }
     notes.push(`Sales total backfill in progress. Processed ${datesToProcess.length} changed date${datesToProcess.length === 1 ? "" : "s"} this run; ${remainingDates.length} remaining.`);
-  } else {
+  } else if (options.commitState) {
     await env.STEAM_REPORTER_STATE.delete(pendingKey);
     await env.STEAM_REPORTER_STATE.put(highwatermarkKey, newHighwatermark);
   }
 
-  if (isFirstRun && baselineOnFirstRun) {
+  if (!options.commitState) {
+    notes.push("Dry run only. KV state was not changed; sales totals are a preview.");
+  }
+
+  if (options.commitState && isFirstRun && baselineOnFirstRun) {
     notes.push("Sales baseline initialized. Historical sales were not posted.");
     return { delta: emptySalesSnapshot(), totals: reportTotalsFromSalesState(salesTotals), baselineInitialized: true, notes };
   }
@@ -513,6 +546,7 @@ async function buildWishlistTotals(
   appId: string,
   appMinDate: string,
   fetchedSnapshots: Map<string, WishlistSnapshotWithPrevious>,
+  options: RunOptions,
 ): Promise<ReportTotals> {
   const today = getUtcDateString(0);
   const totalsKey = `wishlist:totals:${appId}`;
@@ -524,7 +558,9 @@ async function buildWishlistTotals(
     const fetched = fetchedSnapshots.get(date);
     const snapshot = fetched?.current ?? (await fetchWishlistSnapshot(env, appId, date)).snapshot;
     applyWishlistSnapshotToTotals(state, snapshot, null);
-    await putJson(env, `wishlist:${appId}:${date}`, snapshot);
+    if (options.commitState) {
+      await putJson(env, `wishlist:${appId}:${date}`, snapshot);
+    }
   }
 
   const nextCursor = backfillDates.length > 0 ? addUtcDays(backfillDates[backfillDates.length - 1], 1) : startDate;
@@ -537,7 +573,9 @@ async function buildWishlistTotals(
     }
   }
 
-  await putJson(env, totalsKey, state);
+  if (options.commitState) {
+    await putJson(env, totalsKey, state);
+  }
 
   return reportTotalsFromWishlistState(state);
 }

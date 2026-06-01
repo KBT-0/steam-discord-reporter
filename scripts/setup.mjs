@@ -31,6 +31,16 @@ const WRANGLER_BIN_PATH = new URL("node_modules/wrangler/bin/wrangler.js", PROJE
 const KV_NAMESPACE_BINDING = "STEAM_REPORTER_STATE";
 
 async function main() {
+  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+    printHelp();
+    return;
+  }
+
+  if (process.argv.includes("--check-wrangler")) {
+    checkWranglerLoginStatus();
+    return;
+  }
+
   printHeader();
 
   const setupState = await readSetupState();
@@ -120,8 +130,8 @@ async function main() {
       await initializeWorkerTotals(workerUrl, manualRunToken);
     } else {
       console.log("\nCould not detect a workers.dev URL from Wrangler output.");
-      console.log("After deployment, run a safe dry run yourself:");
-      console.log("https://YOUR_WORKER_URL/run?token=" + manualRunToken + "&post=false");
+      console.log("After deployment, initialize totals yourself without posting to Discord:");
+      console.log("https://YOUR_WORKER_URL/run?token=" + manualRunToken + "&post=false&commit=true");
     }
   }
 
@@ -130,6 +140,7 @@ async function main() {
   const manualBaseUrl = workerUrl || "https://YOUR_WORKER_URL";
   console.log("Manual test URL:", manualBaseUrl + "/run?token=" + manualRunToken);
   console.log("Dry run URL:", manualBaseUrl + "/run?token=" + manualRunToken + "&post=false");
+  console.log("Initialize totals URL:", manualBaseUrl + "/run?token=" + manualRunToken + "&post=false&commit=true");
 }
 
 function printHeader() {
@@ -138,6 +149,43 @@ function printHeader() {
   console.log("This setup creates Cloudflare Worker config, KV state, secrets, and deployment.");
   console.log("The Discord report intentionally excludes revenue, gross, net, tax, price, currency, and Steam cut fields.");
   console.log("This setup does not create or push a GitHub repository. Users should clone this repo and deploy their own Worker.\n");
+}
+
+function printHelp() {
+  console.log(`
+Steam Discord Reporter Setup
+
+Usage:
+  npm run setup
+  npm run setup -- --help
+  npm run setup -- --check-wrangler
+
+This interactive setup asks for:
+- Steam project display name and Steam AppID
+- Local report schedule and top country limit
+- Discord webhook URL
+- Steamworks Financial API key
+- Cloudflare Worker name and manual run token
+
+It then checks Wrangler login, creates or reuses the STEAM_REPORTER_STATE KV namespace, writes wrangler.toml, uploads secrets with wrangler secret bulk, and optionally deploys the Worker.
+
+After deploy, setup initializes all-time count totals with:
+  /run?token=YOUR_MANUAL_RUN_TOKEN&post=false&commit=true
+
+That initializes KV state without posting to Discord. Plain post=false is a true dry run and does not change KV state.
+`.trim());
+}
+
+function checkWranglerLoginStatus() {
+  console.log("Checking Cloudflare Wrangler login with the same command runner used by setup...");
+  const result = runWrangler(["whoami"], { capture: true, allowFailure: true });
+  printCommandOutput(result);
+  if (!result.ok) {
+    console.log("\nCloudflare login was not detected. Run `npx wrangler login`, then try `npm run setup -- --check-wrangler` again.");
+    process.exitCode = 1;
+    return;
+  }
+  console.log("\nCloudflare login detected.");
 }
 
 function printSchedulePreview(timeZone, intervalHours, firstHour) {
@@ -602,11 +650,11 @@ function parseWorkersDevUrl(output) {
 
 async function initializeWorkerTotals(workerUrl, manualRunToken) {
   console.log("\nInitializing report totals");
-  console.log("The setup script will call the deployed Worker with post=false, so nothing is posted to Discord.");
+  console.log("The setup script will call the deployed Worker with post=false&commit=true, so totals are saved but nothing is posted to Discord.");
 
   const maxAttempts = 60;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const url = `${workerUrl}/run?token=${encodeURIComponent(manualRunToken)}&post=false`;
+    const url = `${workerUrl}/run?token=${encodeURIComponent(manualRunToken)}&post=false&commit=true`;
     const response = await fetch(url);
     const body = await response.json().catch(() => null);
 
@@ -635,7 +683,7 @@ async function initializeWorkerTotals(workerUrl, manualRunToken) {
   }
 
   console.log("Totals initialization is still in progress.");
-  console.log("The Worker will continue from cached KV state on future dry runs or scheduled report runs.");
+  console.log("The Worker will continue from cached KV state on future committed initialization or scheduled report runs.");
 }
 
 function sleep(ms) {

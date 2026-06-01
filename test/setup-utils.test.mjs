@@ -38,6 +38,7 @@ test("validates setup input formats", () => {
 
 test("normalizes and derives setup defaults", () => {
   assert.equal(normalizeRawInput(' "hello" '), "hello");
+  assert.equal(normalizeRawInput(" '*masked*' "), "*masked*");
   assert.equal(slugify("My Steam Project!"), "my-steam-project");
   assert.equal(slugify("!!!"), "steam-project");
   assert.equal(parsePositiveInteger("12"), 12);
@@ -48,6 +49,7 @@ test("normalizes and derives setup defaults", () => {
 test("builds local report schedule previews", () => {
   assert.deepEqual(buildLocalReportTimes(12, 0), ["00:00", "12:00"]);
   assert.deepEqual(buildLocalReportTimes(12, 23), ["11:00", "23:00"]);
+  assert.deepEqual(buildLocalReportTimes(6, 3), ["03:00", "09:00", "15:00", "21:00"]);
   assert.deepEqual(buildLocalReportTimes(5, 0), ["00:00", "05:00", "10:00", "15:00", "20:00"]);
   assert.equal(intervalDividesDay(12), true);
   assert.equal(intervalDividesDay(5), false);

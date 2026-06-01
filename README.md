@@ -42,7 +42,7 @@ npm run setup
 
 The setup CLI asks for your Steam app, report schedule, Discord webhook, Steam Financial API key, Worker name, and manual run token. It creates or reuses the `STEAM_REPORTER_STATE` KV namespace, writes `wrangler.toml`, uploads secrets with `wrangler secret bulk`, and can deploy the Worker.
 
-After deployment, setup also starts a safe totals initialization by calling the Worker with `post=false`. This fills count totals in KV without posting to Discord. Large Steam histories are processed in small batches to stay under Cloudflare Worker subrequest limits.
+After deployment, setup also starts a safe totals initialization by calling the Worker with `post=false&commit=true`. This fills count totals in KV without posting to Discord. Large Steam histories are processed in small batches to stay under Cloudflare Worker subrequest limits.
 
 The setup does not create GitHub repositories and does not ask for Steam package IDs.
 
@@ -78,12 +78,25 @@ After deployment:
 ```bash
 curl "https://YOUR_WORKER_URL/health"
 curl "https://YOUR_WORKER_URL/run?token=YOUR_MANUAL_RUN_TOKEN&post=false"
+curl "https://YOUR_WORKER_URL/run?token=YOUR_MANUAL_RUN_TOKEN&post=false&commit=true"
 curl "https://YOUR_WORKER_URL/run?token=YOUR_MANUAL_RUN_TOKEN"
 ```
 
-`post=false` fetches and processes data without posting to Discord.
+`post=false` is a true dry run: it fetches and processes data, returns JSON, does not post to Discord, and does not change KV state.
 
-Wishlist all-time totals are built from Steam's daily wishlist reports and cached in KV. For older apps, the first backfill may take multiple safe `post=false` calls and appear as `Known Totals` until complete. Setup starts this automatically after deploy when it can detect the Worker URL; future dry runs or scheduled report runs continue from cached KV state.
+`post=false&commit=true` updates KV snapshots/totals without posting to Discord. Setup uses this after deploy to initialize all-time totals safely.
+
+Wishlist all-time totals are built from Steam's daily wishlist reports and cached in KV. For older apps, the first backfill may take multiple committed initialization calls and appear as `Known Totals` until complete. Setup starts this automatically after deploy when it can detect the Worker URL; future scheduled report runs continue from cached KV state.
+
+## Troubleshooting
+
+To check Wrangler login without changing KV, secrets, or deployment:
+
+```bash
+npm run setup -- --check-wrangler
+```
+
+If PowerShell blocks `npm.ps1`, use `npm.cmd run setup` or adjust your local execution policy. If Wrangler says `workerd` was installed for another platform, delete `node_modules` and run `npm install` again from the same shell you will use for setup. If Wrangler is not logged in, run `npx wrangler login`, then retry setup.
 
 ## Security
 
