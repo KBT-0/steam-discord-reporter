@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.wrangler/
+wrangler.toml
+.setup-state.tmp.json
+.steam-discord-reporter.secrets.tmp.json
+.dev.vars
+.env
+.DS_Store

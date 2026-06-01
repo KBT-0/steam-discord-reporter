@@ -1,0 +1,27 @@
+name = "{{WORKER_NAME}}"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+# Cloudflare cron runs in UTC. The Worker wakes up every 15 minutes
+# and checks whether it is a configured report time in REPORT_TIMEZONE.
+[triggers]
+crons = ["*/15 * * * *"]
+
+[observability]
+enabled = true
+
+[vars]
+PROJECT_DISPLAY_NAME = {{PROJECT_DISPLAY_NAME}}
+STEAM_APP_ID = {{STEAM_APP_ID}}
+ENABLE_WISHLIST_REPORTING = {{ENABLE_WISHLIST_REPORTING}}
+ENABLE_SALES_REPORTING = {{ENABLE_SALES_REPORTING}}
+SEND_EMPTY_REPORTS = {{SEND_EMPTY_REPORTS}}
+BASELINE_SALES_ON_FIRST_RUN = "true"
+TOP_COUNTRY_LIMIT = {{TOP_COUNTRY_LIMIT}}
+REPORT_TIMEZONE = {{REPORT_TIMEZONE}}
+REPORT_INTERVAL_HOURS = {{REPORT_INTERVAL_HOURS}}
+FIRST_LOCAL_REPORT_HOUR = {{FIRST_LOCAL_REPORT_HOUR}}
+
+[[kv_namespaces]]
+binding = "{{KV_NAMESPACE_BINDING}}"
+id = "{{KV_NAMESPACE_ID}}"
