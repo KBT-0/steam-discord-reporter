@@ -42,6 +42,8 @@ npm run setup
 
 The setup CLI asks for your Steam app, report schedule, Discord webhook, Steam Financial API key, Worker name, and manual run token. It creates or reuses the `STEAM_REPORTER_STATE` KV namespace, writes `wrangler.toml`, uploads secrets with `wrangler secret bulk`, and can deploy the Worker.
 
+After deployment, setup also starts a safe totals initialization by calling the Worker with `post=false`. This fills count totals in KV without posting to Discord. Large Steam histories are processed in small batches to stay under Cloudflare Worker subrequest limits.
+
 The setup does not create GitHub repositories and does not ask for Steam package IDs.
 
 ## Getting Credentials
@@ -81,7 +83,7 @@ curl "https://YOUR_WORKER_URL/run?token=YOUR_MANUAL_RUN_TOKEN"
 
 `post=false` fetches and processes data without posting to Discord.
 
-Wishlist all-time totals are built from Steam's daily wishlist reports and cached in KV. For older apps, the first backfill may complete over multiple runs and appear as `Known Totals` until complete.
+Wishlist all-time totals are built from Steam's daily wishlist reports and cached in KV. For older apps, the first backfill may take multiple safe `post=false` calls and appear as `Known Totals` until complete. Setup starts this automatically after deploy when it can detect the Worker URL; future dry runs or scheduled report runs continue from cached KV state.
 
 ## Security
 

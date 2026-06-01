@@ -111,14 +111,25 @@ async function main() {
   });
 
   const shouldDeploy = await confirm("Deploy to Cloudflare now?", true);
+  let workerUrl = "";
   if (shouldDeploy) {
-    runWrangler(["deploy"], { inherit: true });
+    const deploy = runWrangler(["deploy"], { capture: true });
+    printCommandOutput(deploy);
+    workerUrl = parseWorkersDevUrl(`${deploy.stdout}\n${deploy.stderr}`);
+    if (workerUrl) {
+      await initializeWorkerTotals(workerUrl, manualRunToken);
+    } else {
+      console.log("\nCould not detect a workers.dev URL from Wrangler output.");
+      console.log("After deployment, run a safe dry run yourself:");
+      console.log("https://YOUR_WORKER_URL/run?token=" + manualRunToken + "&post=false");
+    }
   }
 
   console.log("\nDone.");
   console.log("Manual run token:", manualRunToken);
-  console.log("Manual test URL: https://YOUR_WORKER_URL/run?token=" + manualRunToken);
-  console.log("Dry run URL: https://YOUR_WORKER_URL/run?token=" + manualRunToken + "&post=false");
+  const manualBaseUrl = workerUrl || "https://YOUR_WORKER_URL";
+  console.log("Manual test URL:", manualBaseUrl + "/run?token=" + manualRunToken);
+  console.log("Dry run URL:", manualBaseUrl + "/run?token=" + manualRunToken + "&post=false");
 }
 
 function printHeader() {
@@ -582,6 +593,53 @@ function printCommandOutput(result) {
   if (result.error) {
     console.error(result.error);
   }
+}
+
+function parseWorkersDevUrl(output) {
+  const match = output.match(/https:\/\/[a-z0-9-]+[^\s]*\.workers\.dev/i);
+  return match?.[0] ?? "";
+}
+
+async function initializeWorkerTotals(workerUrl, manualRunToken) {
+  console.log("\nInitializing report totals");
+  console.log("The setup script will call the deployed Worker with post=false, so nothing is posted to Discord.");
+
+  const maxAttempts = 60;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const url = `${workerUrl}/run?token=${encodeURIComponent(manualRunToken)}&post=false`;
+    const response = await fetch(url);
+    const body = await response.json().catch(() => null);
+
+    if (!response.ok || !body?.ok) {
+      console.log("Totals initialization could not complete automatically.");
+      console.log("Worker response:", JSON.stringify(body ?? { status: response.status }, null, 2));
+      console.log("You can continue it later with the dry run URL printed below.");
+      return;
+    }
+
+    const totals = body.report?.totals;
+    if (!totals) {
+      console.log("The Worker did not return totals yet. You can verify manually with the dry run URL printed below.");
+      return;
+    }
+
+    const knownDays = Number(totals.wishlistKnownDays ?? 0);
+    const complete = Boolean(totals.wishlistBackfillComplete);
+    console.log(`Wishlist totals: ${knownDays} known day${knownDays === 1 ? "" : "s"}${complete ? " (complete)" : ""}.`);
+
+    if (complete) {
+      return;
+    }
+
+    await sleep(1500);
+  }
+
+  console.log("Totals initialization is still in progress.");
+  console.log("The Worker will continue from cached KV state on future dry runs or scheduled report runs.");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function tomlString(value) {
