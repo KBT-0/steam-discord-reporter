@@ -4,6 +4,14 @@
   "description": "Cloudflare Worker automation that reports Steam wishlist and sales activity to Discord without exposing revenue.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KBT-0/steam-discord-reporter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KBT-0/steam-discord-reporter/issues"
+  },
+  "homepage": "https://github.com/KBT-0/steam-discord-reporter#readme",
   "keywords": [
     "steamworks",
     "discord",

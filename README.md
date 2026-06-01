@@ -34,7 +34,7 @@ Cloudflare Cron runs in UTC, so the Worker wakes every 15 minutes and checks whe
 ## Quick Start
 
 ```bash
-git clone https://github.com/<owner>/steam-discord-reporter.git
+git clone https://github.com/KBT-0/steam-discord-reporter.git
 cd steam-discord-reporter
 npm install
 npm run setup
