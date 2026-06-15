@@ -6,6 +6,9 @@ interface Env {
   MANUAL_RUN_TOKEN?: string;
   ENABLE_WISHLIST_REPORTING?: string;
   ENABLE_SALES_REPORTING?: string;
+  ENABLE_PLAYER_COUNT_REPORTING?: string;
+  ENABLE_DAILY_DIGEST?: string;
+  DAILY_DIGEST_LOCAL_HOUR?: string;
   SEND_EMPTY_REPORTS?: string;
   BASELINE_SALES_ON_FIRST_RUN?: string;
   TOP_COUNTRY_LIMIT?: string;
@@ -50,6 +53,13 @@ type SteamChangedDatesResponse = {
   response?: {
     dates?: string[];
     result_highwatermark?: string;
+  };
+};
+
+type SteamCurrentPlayersResponse = {
+  response?: {
+    player_count?: number;
+    result?: number;
   };
 };
 
@@ -116,6 +126,20 @@ type SalesSnapshot = {
   countries: Record<string, CountryTotals>;
 };
 
+// Persisted in KV so the all-time concurrent-player peak survives across runs.
+type PlayerCountState = {
+  peak: number;
+  peakAt?: string;
+};
+
+type PlayerCountSnapshot = {
+  available: boolean;
+  current: number;
+  peak: number;
+  peakAt?: string;
+  newPeak: boolean;
+};
+
 type ReportTotals = {
   wishlistBalance: number;
   wishlistAdds: number;
@@ -148,7 +172,15 @@ type WishlistSnapshotWithPrevious = {
   previous: WishlistSnapshot | null;
 };
 
-type SalesTotalsState = Pick<ReportTotals, "unitsSold" | "refunds" | "keyActivations" | "salesKnownDays">;
+type SalesTotalsState = Pick<ReportTotals, "unitsSold" | "refunds" | "keyActivations" | "salesKnownDays"> & {
+  countries: Record<string, CountryTotals>;
+};
+
+// Lifetime owner count = units sold - refunds + key activations, with a per-country breakdown.
+type OwnersSummary = {
+  total: number;
+  countries: Record<string, CountryTotals>;
+};
 
 type PendingSalesDates = {
   dates: string[];
@@ -160,19 +192,32 @@ type RunOptions = {
   commitState: boolean;
 };
 
+type LocalDateTimeParts = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+};
+
 type RunReport = {
   projectName: string;
   appId: string;
   generatedAt: string;
   wishlist: WishlistSnapshot;
   sales: SalesSnapshot;
+  players: PlayerCountSnapshot;
+  owners: OwnersSummary;
   totals: ReportTotals;
   wishlistBaselineInitialized: boolean;
   salesBaselineInitialized: boolean;
   notes: string[];
+  // Present when this report is the daily end-of-day digest for a finalized Steam (UTC) day.
+  digest?: { date: string };
 };
 
 const STEAM_FINANCIAL_BASE_URL = "https://partner.steam-api.com/IPartnerFinancialsService";
+const STEAM_WEB_API_BASE_URL = "https://api.steampowered.com";
 const MAX_WISHLIST_TOTAL_BACKFILL_DAYS_PER_RUN = 10;
 const MAX_SALES_CHANGED_DATES_PER_RUN = 4;
 
@@ -198,13 +243,14 @@ export default {
 
     const shouldPost = url.searchParams.get("post") !== "false";
     const commitState = shouldPost || url.searchParams.get("commit") === "true";
+    const isDigest = url.searchParams.get("mode") === "digest";
 
     try {
-      const report = await buildReport(env, { commitState });
+      const report = isDigest ? await buildDailyDigest(env) : await buildReport(env, { commitState });
       if (shouldPost) {
         await postDiscordReport(env, report);
       }
-      return jsonResponse({ ok: true, posted: shouldPost, stateCommitted: commitState, report });
+      return jsonResponse({ ok: true, posted: shouldPost, stateCommitted: commitState && !isDigest, report });
     } catch (error) {
       return jsonResponse({ ok: false, error: errorToMessage(error) }, 500);
     }
@@ -212,11 +258,26 @@ export default {
 };
 
 async function runScheduled(env: Env): Promise<void> {
-  if (!(await shouldRunScheduledReport(env))) {
+  const timeZone = resolveReportTimeZone(env);
+  const local = getLocalDateTimeParts(new Date(), timeZone);
+
+  // Cron fires every 15 minutes; only the top of the hour is a candidate report slot.
+  if (local.minute !== 0) {
     return;
   }
 
-  await runAndPost(env);
+  if (await shouldRunIncrementalReport(env, timeZone, local)) {
+    await runAndPost(env);
+  }
+
+  if (await shouldRunDailyDigest(env, timeZone, local)) {
+    await runDailyDigest(env);
+  }
+}
+
+async function runDailyDigest(env: Env): Promise<void> {
+  const report = await buildDailyDigest(env);
+  await postDiscordReport(env, report);
 }
 
 async function runAndPost(env: Env): Promise<void> {
@@ -245,6 +306,8 @@ async function buildReport(env: Env, options: RunOptions): Promise<RunReport> {
     generatedAt: new Date().toISOString(),
     wishlist: emptyWishlistSnapshot(),
     sales: emptySalesSnapshot(),
+    players: emptyPlayerCountSnapshot(),
+    owners: emptyOwnersSummary(),
     totals: emptyReportTotals(),
     wishlistBaselineInitialized: false,
     salesBaselineInitialized: false,
@@ -271,6 +334,7 @@ async function buildReport(env: Env, options: RunOptions): Promise<RunReport> {
   if (parseBool(env.ENABLE_SALES_REPORTING, true)) {
     const salesResult = await buildSalesDelta(env, appId, options);
     report.sales = salesResult.delta;
+    report.owners = salesResult.owners;
     report.totals = {
       ...report.totals,
       unitsSold: salesResult.totals.unitsSold,
@@ -280,6 +344,65 @@ async function buildReport(env: Env, options: RunOptions): Promise<RunReport> {
     };
     report.salesBaselineInitialized = salesResult.baselineInitialized;
     report.notes.push(...salesResult.notes);
+  }
+
+  if (parseBool(env.ENABLE_PLAYER_COUNT_REPORTING, true)) {
+    const playerResult = await buildPlayerCount(env, appId, options);
+    report.players = playerResult.snapshot;
+    report.notes.push(...playerResult.notes);
+  }
+
+  return report;
+}
+
+// End-of-day digest: reports a finalized Steam (UTC) reporting day in full, with country breakdowns.
+// It reads lifetime totals from cached KV state and never commits, so it can run alongside the hourly report.
+async function buildDailyDigest(env: Env): Promise<RunReport> {
+  const appId = requireEnv(env.STEAM_APP_ID, "STEAM_APP_ID");
+  const projectName = requireEnv(configValue(env, "PROJECT_DISPLAY_NAME", "STEAM_PROJECT_NAME"), "PROJECT_DISPLAY_NAME");
+  requireEnv(env.STEAM_FINANCIAL_API_KEY, "STEAM_FINANCIAL_API_KEY");
+
+  const digestDate = getUtcDateString(-1);
+
+  const report: RunReport = {
+    projectName,
+    appId,
+    generatedAt: new Date().toISOString(),
+    wishlist: emptyWishlistSnapshot(),
+    sales: emptySalesSnapshot(),
+    players: emptyPlayerCountSnapshot(),
+    owners: emptyOwnersSummary(),
+    totals: emptyReportTotals(),
+    wishlistBaselineInitialized: false,
+    salesBaselineInitialized: false,
+    notes: [],
+    digest: { date: digestDate },
+  };
+
+  if (parseBool(env.ENABLE_WISHLIST_REPORTING, true)) {
+    const fetched = await fetchWishlistSnapshot(env, appId, digestDate);
+    report.wishlist = fetched.snapshot;
+  }
+
+  if (parseBool(env.ENABLE_SALES_REPORTING, true)) {
+    report.sales = await fetchSalesSnapshotForDate(env, appId, digestDate);
+  }
+
+  const wishlistState = await getWishlistTotalsState(env, appId, getUtcDateString(0));
+  const salesState = await getSalesTotalsState(env, appId);
+  report.totals = {
+    ...reportTotalsFromWishlistState(wishlistState),
+    unitsSold: salesState.unitsSold,
+    refunds: salesState.refunds,
+    keyActivations: salesState.keyActivations,
+    salesKnownDays: salesState.salesKnownDays,
+  };
+  report.owners = ownersFromSalesState(salesState);
+
+  if (parseBool(env.ENABLE_PLAYER_COUNT_REPORTING, true)) {
+    const playerResult = await buildPlayerCount(env, appId, { commitState: false });
+    report.players = playerResult.snapshot;
+    report.notes.push(...playerResult.notes);
   }
 
   return report;
@@ -385,7 +508,7 @@ async function buildSalesDelta(
   env: Env,
   appId: string,
   options: RunOptions,
-): Promise<{ delta: SalesSnapshot; totals: ReportTotals; baselineInitialized: boolean; notes: string[] }> {
+): Promise<{ delta: SalesSnapshot; totals: ReportTotals; owners: OwnersSummary; baselineInitialized: boolean; notes: string[] }> {
   const highwatermarkKey = `sales:changed_dates_highwatermark:${appId}`;
   const pendingKey = `sales:pending_changed_dates:${appId}`;
   const storedHighwatermark = await env.STEAM_REPORTER_STATE.get(highwatermarkKey);
@@ -414,7 +537,14 @@ async function buildSalesDelta(
       notes.push("Dry run only. KV state was not changed; sales highwatermark was not updated.");
     }
     notes.push("No changed sales dates reported by Steam.");
-    return { delta: totalDelta, totals: await buildSalesTotals(env, appId), baselineInitialized: false, notes };
+    const idleState = await getSalesTotalsState(env, appId);
+    return {
+      delta: totalDelta,
+      totals: reportTotalsFromSalesState(idleState),
+      owners: ownersFromSalesState(idleState),
+      baselineInitialized: false,
+      notes,
+    };
   }
 
   const datesToProcess = dates.slice(0, MAX_SALES_CHANGED_DATES_PER_RUN);
@@ -466,10 +596,22 @@ async function buildSalesDelta(
 
   if (options.commitState && isFirstRun && baselineOnFirstRun) {
     notes.push("Sales baseline initialized. Historical sales were not posted.");
-    return { delta: emptySalesSnapshot(), totals: reportTotalsFromSalesState(salesTotals), baselineInitialized: true, notes };
+    return {
+      delta: emptySalesSnapshot(),
+      totals: reportTotalsFromSalesState(salesTotals),
+      owners: ownersFromSalesState(salesTotals),
+      baselineInitialized: true,
+      notes,
+    };
   }
 
-  return { delta: totalDelta, totals: reportTotalsFromSalesState(salesTotals), baselineInitialized: false, notes };
+  return {
+    delta: totalDelta,
+    totals: reportTotalsFromSalesState(salesTotals),
+    owners: ownersFromSalesState(salesTotals),
+    baselineInitialized: false,
+    notes,
+  };
 }
 
 async function fetchChangedDates(env: Env, highwatermark: string): Promise<{ dates: string[]; resultHighwatermark: string | undefined }> {
@@ -541,6 +683,55 @@ async function fetchDetailedSales(env: Env, date: string, highwatermarkId: strin
   return fetchJson<SteamDetailedSalesResponse>(url);
 }
 
+async function buildPlayerCount(
+  env: Env,
+  appId: string,
+  options: RunOptions,
+): Promise<{ snapshot: PlayerCountSnapshot; notes: string[] }> {
+  const notes: string[] = [];
+  const stateKey = `players:peak:${appId}`;
+  const stored = await getJson<PlayerCountState>(env, stateKey);
+  const previousPeak = Math.max(0, toNumber(stored?.peak));
+
+  let current: number | null = null;
+  try {
+    current = await fetchCurrentPlayers(env, appId);
+  } catch (error) {
+    notes.push(`Could not fetch current player count: ${errorToMessage(error)}`);
+  }
+
+  const available = current != null;
+  const currentValue = current ?? 0;
+  const peak = Math.max(previousPeak, currentValue);
+  const improved = available && peak > previousPeak;
+  // Only call it a record once a real baseline exists; the first observation just seeds the peak.
+  const newPeak = improved && previousPeak > 0;
+  const peakAt = improved ? new Date().toISOString() : stored?.peakAt;
+
+  if (options.commitState && improved) {
+    await putJson(env, stateKey, { peak, peakAt } satisfies PlayerCountState);
+  }
+
+  return {
+    snapshot: { available, current: currentValue, peak, peakAt, newPeak },
+    notes,
+  };
+}
+
+async function fetchCurrentPlayers(env: Env, appId: string): Promise<number> {
+  const url = new URL(`${STEAM_WEB_API_BASE_URL}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/`);
+  url.searchParams.set("appid", appId);
+  url.searchParams.set("format", "json");
+
+  const data = await fetchJson<SteamCurrentPlayersResponse>(url);
+  const response = data.response;
+  if (response?.result !== 1 || response.player_count == null) {
+    throw new Error("Steam did not return a current player count for this app.");
+  }
+
+  return toNumber(response.player_count);
+}
+
 async function buildWishlistTotals(
   env: Env,
   appId: string,
@@ -580,10 +771,6 @@ async function buildWishlistTotals(
   return reportTotalsFromWishlistState(state);
 }
 
-async function buildSalesTotals(env: Env, appId: string): Promise<ReportTotals> {
-  return reportTotalsFromSalesState(await getSalesTotalsState(env, appId));
-}
-
 async function getWishlistTotalsState(env: Env, appId: string, fallbackStartDate: string): Promise<WishlistTotalsState> {
   const stored = await getJson<WishlistTotalsState>(env, `wishlist:totals:${appId}`);
   if (stored) {
@@ -606,14 +793,39 @@ async function getWishlistTotalsState(env: Env, appId: string, fallbackStartDate
 }
 
 async function getSalesTotalsState(env: Env, appId: string): Promise<SalesTotalsState> {
-  return (
-    (await getJson<SalesTotalsState>(env, `sales:totals:${appId}`)) ?? {
-      unitsSold: 0,
-      refunds: 0,
-      keyActivations: 0,
-      salesKnownDays: 0,
-    }
-  );
+  const stored = await getJson<SalesTotalsState>(env, `sales:totals:${appId}`);
+  if (stored) {
+    // Older state predates per-country owner tracking; default it so accumulation can start.
+    return { ...stored, countries: stored.countries ?? {} };
+  }
+
+  return {
+    unitsSold: 0,
+    refunds: 0,
+    keyActivations: 0,
+    salesKnownDays: 0,
+    countries: {},
+  };
+}
+
+function ownersFromSalesState(state: SalesTotalsState): OwnersSummary {
+  const countries: Record<string, CountryTotals> = {};
+  for (const country of Object.values(state.countries ?? {})) {
+    countries[country.countryCode] = { ...country };
+  }
+
+  return {
+    total: ownerCount(state.unitsSold, state.refunds, state.keyActivations),
+    countries,
+  };
+}
+
+function ownerCount(unitsSold: number, refunds: number, keyActivations: number): number {
+  return Math.max(0, unitsSold - refunds + keyActivations);
+}
+
+function emptyOwnersSummary(): OwnersSummary {
+  return { total: 0, countries: {} };
 }
 
 function applyWishlistSnapshotToTotals(state: WishlistTotalsState, current: WishlistSnapshot, previous: WishlistSnapshot | null): void {
@@ -634,6 +846,16 @@ function applySalesSnapshotToTotals(state: SalesTotalsState, current: SalesSnaps
   state.unitsSold += current.unitsSold - previousSnapshot.unitsSold;
   state.refunds += current.refunds - previousSnapshot.refunds;
   state.keyActivations += current.keyActivations - previousSnapshot.keyActivations;
+
+  const countryCodes = uniqueStrings([...Object.keys(current.countries), ...Object.keys(previousSnapshot.countries)]);
+  for (const code of countryCodes) {
+    const currentCountry = current.countries[code] ?? emptyCountryTotals(code);
+    const previousCountry = previousSnapshot.countries[code] ?? emptyCountryTotals(code);
+    const target = getOrCreateCountry(state.countries, code, currentCountry.countryName ?? previousCountry.countryName);
+    target.unitsSold += currentCountry.unitsSold - previousCountry.unitsSold;
+    target.refunds += currentCountry.refunds - previousCountry.refunds;
+    target.keyActivations += currentCountry.keyActivations - previousCountry.keyActivations;
+  }
 
   if (!previous) {
     state.salesKnownDays += 1;
@@ -675,33 +897,48 @@ async function postDiscordReport(env: Env, report: RunReport): Promise<void> {
   const topCountryLimit = parseIntSafe(env.TOP_COUNTRY_LIMIT, 5);
   const active = hasActivity(report);
   const timeZone = resolveReportTimeZone(env);
+  const isDigest = report.digest != null;
+  const daySuffix = isDigest ? ` (${report.digest!.date} UTC)` : "";
 
   const fields = [
     {
       name: report.totals.wishlistBackfillComplete ? "Totals" : "Known Totals",
-      value: formatTotals(report.totals),
+      value: formatTotals(report.totals, report.owners),
       inline: false,
     },
     {
-      name: "Wishlist",
+      name: `Wishlist${daySuffix}`,
       value: formatWishlist(report.wishlist),
       inline: false,
     },
     {
-      name: "Sales",
+      name: `Sales${daySuffix}`,
       value: formatSales(report.sales),
       inline: false,
     },
   ];
 
+  if (report.players.available || report.players.peak > 0) {
+    fields.push({
+      name: "Players",
+      value: formatPlayers(report.players, timeZone),
+      inline: false,
+    });
+  }
+
+  const ownerCountries = formatTopOwnerCountries(report.owners.countries, topCountryLimit);
+  if (ownerCountries) {
+    fields.push({ name: "Top Owner Countries", value: ownerCountries, inline: false });
+  }
+
   const wishlistCountries = formatTopCountries(report.wishlist.countries, "wishlistAdds", "wishlist", topCountryLimit);
   if (wishlistCountries) {
-    fields.push({ name: "Top Wishlist Countries", value: wishlistCountries, inline: false });
+    fields.push({ name: `Top Wishlist Countries${daySuffix}`, value: wishlistCountries, inline: false });
   }
 
   const salesCountries = formatTopCountries(report.sales.countries, "unitsSold", "sold", topCountryLimit);
   if (salesCountries) {
-    fields.push({ name: "Top Sales Countries", value: salesCountries, inline: false });
+    fields.push({ name: `Top Sales Countries${daySuffix}`, value: salesCountries, inline: false });
   }
 
   if (report.notes.length > 0) {
@@ -714,15 +951,22 @@ async function postDiscordReport(env: Env, report: RunReport): Promise<void> {
     inline: false,
   });
 
+  const title = isDigest
+    ? `📅 ${report.projectName} — Daily Summary`
+    : `🎮 ${report.projectName} — Steam Report`;
+  const description = isDigest
+    ? `End-of-day summary for Steam reporting day ${report.digest!.date} (UTC).`
+    : active
+      ? "Latest Steam activity counts."
+      : "No new Steam activity.";
+
   const body = {
     username: "Steam Reporter",
     allowed_mentions: { parse: [] as string[] },
     embeds: [
       {
-        title: `🎮 ${report.projectName} — Steam Report`,
-        description: active
-          ? "Latest Steam activity counts."
-          : "No new Steam activity.",
+        title,
+        description,
         fields,
         timestamp: report.generatedAt,
       },
@@ -757,14 +1001,52 @@ function formatSales(sales: SalesSnapshot): string {
   ].join("\n");
 }
 
-function formatTotals(totals: ReportTotals): string {
+function formatPlayers(players: PlayerCountSnapshot, timeZone: string): string {
+  const lines: string[] = [];
+
+  if (players.available) {
+    lines.push(`${formatPlain(players.current)} players online now`);
+  } else {
+    lines.push("Current player count unavailable");
+  }
+
+  if (players.peak > 0) {
+    const peakSuffix = players.peakAt ? ` (set ${formatDateTime(players.peakAt, timeZone)})` : "";
+    const recordTag = players.newPeak ? " 🏆 new record" : "";
+    lines.push(`${formatPlain(players.peak)} peak players online${peakSuffix}${recordTag}`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatTotals(totals: ReportTotals, owners: OwnersSummary): string {
   return [
+    `${formatPlain(owners.total)} total owners (lifetime downloads)`,
     `${formatPlain(totals.wishlistBalance)} current wishlist balance`,
     `${formatPlain(totals.wishlistAdds)} lifetime wishlist adds`,
     `${formatPlain(totals.unitsSold)} lifetime units sold`,
     `${formatPlain(totals.refunds)} lifetime refunds`,
     `${formatPlain(totals.keyActivations)} lifetime key activations`,
   ].join("\n");
+}
+
+function formatTopOwnerCountries(countries: Record<string, CountryTotals>, limit: number): string | null {
+  const entries = Object.values(countries)
+    .map((country) => ({ country, owners: ownerCount(country.unitsSold, country.refunds, country.keyActivations) }))
+    .filter((entry) => entry.owners > 0)
+    .sort((a, b) => b.owners - a.owners)
+    .slice(0, limit);
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  return entries
+    .map(({ country, owners }) => {
+      const name = country.countryName || country.countryCode;
+      return `${countryCodeToFlag(country.countryCode)} ${name}: ${owners} owners`;
+    })
+    .join("\n");
 }
 
 function formatTopCountries(
@@ -804,7 +1086,7 @@ function hasActivity(report: RunReport): boolean {
 
 
 function parseScheduleIntervalHours(env: Env): number {
-  return parseIntSafe(env.REPORT_INTERVAL_HOURS, 12);
+  return parseIntSafe(env.REPORT_INTERVAL_HOURS, 1);
 }
 
 function parseFirstReportLocalHour(env: Env): number {
@@ -812,25 +1094,23 @@ function parseFirstReportLocalHour(env: Env): number {
   return Number.isInteger(hour) && hour >= 0 && hour <= 23 ? hour : 0;
 }
 
-async function shouldRunScheduledReport(env: Env): Promise<boolean> {
-  const timeZone = resolveReportTimeZone(env);
+function parseDigestLocalHour(env: Env): number {
+  const hour = Number.parseInt(env.DAILY_DIGEST_LOCAL_HOUR ?? "0", 10);
+  return Number.isInteger(hour) && hour >= 0 && hour <= 23 ? hour : 0;
+}
+
+// Hourly (or REPORT_INTERVAL_HOURS) incremental report. Posts only when activity changed.
+async function shouldRunIncrementalReport(env: Env, timeZone: string, local: LocalDateTimeParts): Promise<boolean> {
   const intervalHours = parseScheduleIntervalHours(env);
   const firstHour = parseFirstReportLocalHour(env);
-  const local = getLocalDateTimeParts(new Date(), timeZone);
-
-  if (local.minute !== 0) {
-    return false;
-  }
 
   if (positiveModulo(local.hour - firstHour, intervalHours) !== 0) {
     return false;
   }
 
   const slotKey = `schedule:last_slot:${timeZone}:${intervalHours}:${firstHour}`;
-  const slotValue = `${local.year}-${String(local.month).padStart(2, "0")}-${String(local.day).padStart(2, "0")}-${String(local.hour).padStart(2, "0")}`;
-  const previousSlot = await env.STEAM_REPORTER_STATE.get(slotKey);
-
-  if (previousSlot === slotValue) {
+  const slotValue = `${local.year}-${pad2(local.month)}-${pad2(local.day)}-${pad2(local.hour)}`;
+  if ((await env.STEAM_REPORTER_STATE.get(slotKey)) === slotValue) {
     return false;
   }
 
@@ -838,7 +1118,27 @@ async function shouldRunScheduledReport(env: Env): Promise<boolean> {
   return true;
 }
 
-function getLocalDateTimeParts(date: Date, timeZone: string): { year: number; month: number; day: number; hour: number; minute: number } {
+// Once-per-day end-of-day digest, posted even when nothing changed.
+async function shouldRunDailyDigest(env: Env, timeZone: string, local: LocalDateTimeParts): Promise<boolean> {
+  if (!parseBool(env.ENABLE_DAILY_DIGEST, true)) {
+    return false;
+  }
+
+  if (local.hour !== parseDigestLocalHour(env)) {
+    return false;
+  }
+
+  const slotKey = `digest:last_day:${timeZone}:${parseDigestLocalHour(env)}`;
+  const slotValue = `${local.year}-${pad2(local.month)}-${pad2(local.day)}`;
+  if ((await env.STEAM_REPORTER_STATE.get(slotKey)) === slotValue) {
+    return false;
+  }
+
+  await env.STEAM_REPORTER_STATE.put(slotKey, slotValue);
+  return true;
+}
+
+function getLocalDateTimeParts(date: Date, timeZone: string): LocalDateTimeParts {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone,
     year: "numeric",
@@ -968,6 +1268,16 @@ function emptySalesSnapshot(): SalesSnapshot {
     refunds: 0,
     keyActivations: 0,
     countries: {},
+  };
+}
+
+function emptyPlayerCountSnapshot(): PlayerCountSnapshot {
+  return {
+    available: false,
+    current: 0,
+    peak: 0,
+    peakAt: undefined,
+    newPeak: false,
   };
 }
 
@@ -1221,6 +1531,10 @@ function formatSigned(value: number): string {
 
 function formatPlain(value: number): string {
   return String(value);
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
 }
 
 function uniqueStrings(values: string[]): string[] {

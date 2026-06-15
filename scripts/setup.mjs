@@ -61,7 +61,7 @@ async function main() {
     askTimeZone("Report timezone", setupState.reportTimezone ?? detectedTimeZone),
   );
   const reportIntervalHours = await askAndSave(setupState, "reportIntervalHours", () =>
-    askIntervalHours("Report interval in hours", setupState.reportIntervalHours ?? "12"),
+    askIntervalHours("Report interval in hours", setupState.reportIntervalHours ?? "1"),
   );
   const firstReportHour = await askAndSave(setupState, "firstLocalReportHour", () =>
     askHour("First local report hour, 0-23", setupState.firstLocalReportHour ?? "0"),
@@ -72,7 +72,7 @@ async function main() {
     askPositiveInteger("Top country limit", setupState.topCountryLimit ?? "5"),
   );
   const sendEmptyReports = await askAndSave(setupState, "sendEmptyReports", () =>
-    confirm("Send reports even when there is no new activity?", savedBoolean(setupState.sendEmptyReports, true)),
+    confirm("Send reports even when there is no new activity?", savedBoolean(setupState.sendEmptyReports, false)),
   );
   const enableWishlist = await askAndSave(setupState, "enableWishlistReporting", () =>
     confirm("Enable wishlist reporting?", savedBoolean(setupState.enableWishlistReporting, true)),
@@ -80,6 +80,19 @@ async function main() {
   const enableSales = await askAndSave(setupState, "enableSalesReporting", () =>
     confirm("Enable sales/refund/key activation reporting?", savedBoolean(setupState.enableSalesReporting, true)),
   );
+  const enablePlayerCount = await askAndSave(setupState, "enablePlayerCountReporting", () =>
+    confirm("Enable current/peak player count and total owners reporting?", savedBoolean(setupState.enablePlayerCountReporting, true)),
+  );
+  const enableDailyDigest = await askAndSave(setupState, "enableDailyDigest", () =>
+    confirm("Also send a separate end-of-day digest once a day?", savedBoolean(setupState.enableDailyDigest, true)),
+  );
+  const dailyDigestHour = await askAndSave(setupState, "dailyDigestLocalHour", () =>
+    askHour("Daily digest local hour, 0-23", setupState.dailyDigestLocalHour ?? "0"),
+  );
+  if (enableDailyDigest) {
+    console.log(`The end-of-day digest will post once a day around ${String(dailyDigestHour).padStart(2, "0")}:00 ${reportTimeZone},`);
+    console.log("summarizing the most recent finalized Steam (UTC) reporting day with country breakdowns.\n");
+  }
 
   printDiscordWebhookHelp();
   const discordWebhookUrl = await askDiscordWebhookUrl("Discord webhook URL");
@@ -112,6 +125,9 @@ async function main() {
     sendEmptyReports,
     enableWishlist,
     enableSales,
+    enablePlayerCount,
+    enableDailyDigest,
+    dailyDigestHour,
   });
 
   await putSecretsBulk({
@@ -402,6 +418,9 @@ async function saveSetupState(state) {
     sendEmptyReports: state.sendEmptyReports,
     enableWishlistReporting: state.enableWishlistReporting,
     enableSalesReporting: state.enableSalesReporting,
+    enablePlayerCountReporting: state.enablePlayerCountReporting,
+    enableDailyDigest: state.enableDailyDigest,
+    dailyDigestLocalHour: state.dailyDigestLocalHour,
     workerName: state.workerName,
     kvNamespaceId: state.kvNamespaceId,
   };
@@ -537,7 +556,10 @@ async function writeWranglerToml(config) {
     .replaceAll("{{TOP_COUNTRY_LIMIT}}", tomlString(config.topCountryLimit))
     .replaceAll("{{SEND_EMPTY_REPORTS}}", tomlString(String(config.sendEmptyReports)))
     .replaceAll("{{ENABLE_WISHLIST_REPORTING}}", tomlString(String(config.enableWishlist)))
-    .replaceAll("{{ENABLE_SALES_REPORTING}}", tomlString(String(config.enableSales)));
+    .replaceAll("{{ENABLE_SALES_REPORTING}}", tomlString(String(config.enableSales)))
+    .replaceAll("{{ENABLE_PLAYER_COUNT_REPORTING}}", tomlString(String(config.enablePlayerCount)))
+    .replaceAll("{{ENABLE_DAILY_DIGEST}}", tomlString(String(config.enableDailyDigest)))
+    .replaceAll("{{DAILY_DIGEST_LOCAL_HOUR}}", tomlString(config.dailyDigestHour));
 
   await writeFile(WRANGLER_PATH, template, "utf8");
   console.log("Created wrangler.toml");
