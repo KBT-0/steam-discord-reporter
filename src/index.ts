@@ -246,11 +246,11 @@ export default {
     const isDigest = url.searchParams.get("mode") === "digest";
 
     try {
-      const report = isDigest ? await buildDailyDigest(env) : await buildReport(env, { commitState });
+      const report = isDigest ? await buildDailyDigest(env, { commitState }) : await buildReport(env, { commitState });
       if (shouldPost) {
         await postDiscordReport(env, report);
       }
-      return jsonResponse({ ok: true, posted: shouldPost, stateCommitted: commitState && !isDigest, report });
+      return jsonResponse({ ok: true, posted: shouldPost, stateCommitted: commitState, report });
     } catch (error) {
       return jsonResponse({ ok: false, error: errorToMessage(error) }, 500);
     }
@@ -276,7 +276,7 @@ async function runScheduled(env: Env): Promise<void> {
 }
 
 async function runDailyDigest(env: Env): Promise<void> {
-  const report = await buildDailyDigest(env);
+  const report = await buildDailyDigest(env, { commitState: true });
   await postDiscordReport(env, report);
 }
 
@@ -356,28 +356,14 @@ async function buildReport(env: Env, options: RunOptions): Promise<RunReport> {
 }
 
 // End-of-day digest: reports a finalized Steam (UTC) reporting day in full, with country breakdowns.
-// It reads lifetime totals from cached KV state and never commits, so it can run alongside the hourly report.
-async function buildDailyDigest(env: Env): Promise<RunReport> {
+// It first runs the normal report so lifetime totals, owners, and players are always freshly computed
+// (not read stale from KV), then overlays that day's full wishlist/sales snapshots for the digest view.
+async function buildDailyDigest(env: Env, options: RunOptions): Promise<RunReport> {
   const appId = requireEnv(env.STEAM_APP_ID, "STEAM_APP_ID");
-  const projectName = requireEnv(configValue(env, "PROJECT_DISPLAY_NAME", "STEAM_PROJECT_NAME"), "PROJECT_DISPLAY_NAME");
-  requireEnv(env.STEAM_FINANCIAL_API_KEY, "STEAM_FINANCIAL_API_KEY");
+  const report = await buildReport(env, options);
 
   const digestDate = getUtcDateString(-1);
-
-  const report: RunReport = {
-    projectName,
-    appId,
-    generatedAt: new Date().toISOString(),
-    wishlist: emptyWishlistSnapshot(),
-    sales: emptySalesSnapshot(),
-    players: emptyPlayerCountSnapshot(),
-    owners: emptyOwnersSummary(),
-    totals: emptyReportTotals(),
-    wishlistBaselineInitialized: false,
-    salesBaselineInitialized: false,
-    notes: [],
-    digest: { date: digestDate },
-  };
+  report.digest = { date: digestDate };
 
   if (parseBool(env.ENABLE_WISHLIST_REPORTING, true)) {
     const fetched = await fetchWishlistSnapshot(env, appId, digestDate);
@@ -386,23 +372,6 @@ async function buildDailyDigest(env: Env): Promise<RunReport> {
 
   if (parseBool(env.ENABLE_SALES_REPORTING, true)) {
     report.sales = await fetchSalesSnapshotForDate(env, appId, digestDate);
-  }
-
-  const wishlistState = await getWishlistTotalsState(env, appId, getUtcDateString(0));
-  const salesState = await getSalesTotalsState(env, appId);
-  report.totals = {
-    ...reportTotalsFromWishlistState(wishlistState),
-    unitsSold: salesState.unitsSold,
-    refunds: salesState.refunds,
-    keyActivations: salesState.keyActivations,
-    salesKnownDays: salesState.salesKnownDays,
-  };
-  report.owners = ownersFromSalesState(salesState);
-
-  if (parseBool(env.ENABLE_PLAYER_COUNT_REPORTING, true)) {
-    const playerResult = await buildPlayerCount(env, appId, { commitState: false });
-    report.players = playerResult.snapshot;
-    report.notes.push(...playerResult.notes);
   }
 
   return report;
@@ -697,7 +666,16 @@ async function buildPlayerCount(
   try {
     current = await fetchCurrentPlayers(env, appId);
   } catch (error) {
+    // Only surface genuinely unexpected failures. "No data" (unreleased app) is handled as null below.
     notes.push(`Could not fetch current player count: ${errorToMessage(error)}`);
+  }
+
+  // Unreleased apps return no live player data; report nothing rather than a scary error.
+  if (current == null && previousPeak === 0) {
+    return {
+      snapshot: emptyPlayerCountSnapshot(),
+      notes,
+    };
   }
 
   const available = current != null;
@@ -718,18 +696,28 @@ async function buildPlayerCount(
   };
 }
 
-async function fetchCurrentPlayers(env: Env, appId: string): Promise<number> {
+// Returns null when Steam has no live player data for the app (e.g. unreleased: HTTP 404 or result != 1).
+// Throws only on genuinely unexpected HTTP errors so the caller can surface those.
+async function fetchCurrentPlayers(env: Env, appId: string): Promise<number | null> {
   const url = new URL(`${STEAM_WEB_API_BASE_URL}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/`);
   url.searchParams.set("appid", appId);
   url.searchParams.set("format", "json");
 
-  const data = await fetchJson<SteamCurrentPlayersResponse>(url);
-  const response = data.response;
-  if (response?.result !== 1 || response.player_count == null) {
-    throw new Error("Steam did not return a current player count for this app.");
+  const response = await fetch(url.toString());
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`Steam API failed: ${response.status} ${await response.text()}`);
   }
 
-  return toNumber(response.player_count);
+  const data = (await response.json()) as SteamCurrentPlayersResponse;
+  const result = data.response;
+  if (result?.result !== 1 || result.player_count == null) {
+    return null;
+  }
+
+  return toNumber(result.player_count);
 }
 
 async function buildWishlistTotals(
