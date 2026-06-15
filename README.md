@@ -33,7 +33,19 @@ Player counts come from the public `ISteamUserStats/GetNumberOfCurrentPlayers` e
 
 ### Total owners
 
-Reports include a `total owners (lifetime downloads)` line, computed as `lifetime units sold - refunds + key activations`. This is the number of accounts that currently own the game. Steam does not expose a public "total downloads" endpoint, so this derived count is the accurate stand-in. Per-country owner totals are tracked in KV from the moment this version is deployed and shown under `Top Owner Countries`.
+Reports include a `total owners (lifetime downloads)` line, computed as `lifetime units sold - refunds + key activations` (free/complimentary licenses are included in units). This is the number of accounts that currently own the game. Steam does not expose a public "total downloads" endpoint, so this derived count is the accurate stand-in. Per-country owner totals are tracked in KV from the moment this version is deployed and shown under `Top Owner Countries`.
+
+### Separate app IDs (e.g. a demo)
+
+Wishlists, downloads/owners, and live players can live on different Steam apps. A common case: wishlists are on the main (unreleased) app while downloads and players are on a separate demo app. Point each metric at the right app:
+
+```toml
+STEAM_APP_ID = "111111"               # wishlists (main app)
+STEAM_SALES_APP_ID = "222222"         # units, owners, key activations (e.g. the demo)
+STEAM_PLAYER_COUNT_APP_ID = "222222"  # current/peak players (e.g. the demo)
+```
+
+Both extra vars default to `STEAM_APP_ID` when unset, so single-app setups need nothing. Switching `STEAM_SALES_APP_ID` to a new app re-baselines sales for that app on the next run (historical units are counted into totals but not posted as a delta).
 
 ### Country breakdowns
 

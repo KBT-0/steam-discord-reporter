@@ -55,7 +55,13 @@ async function main() {
     askRequired("Steam project display name", setupState.projectDisplayName ?? "My Steam Game"),
   );
   const appId = await askAndSave(setupState, "steamAppId", () =>
-    askSteamAppId("Steam AppID", setupState.steamAppId),
+    askSteamAppId("Steam AppID (wishlists)", setupState.steamAppId),
+  );
+  const salesAppId = await askAndSave(setupState, "steamSalesAppId", () =>
+    askSteamAppId("Sales/owners Steam AppID (Enter to reuse main, or a demo AppID)", setupState.steamSalesAppId ?? appId),
+  );
+  const playerCountAppId = await askAndSave(setupState, "steamPlayerCountAppId", () =>
+    askSteamAppId("Player count Steam AppID (Enter to reuse main, or a demo AppID)", setupState.steamPlayerCountAppId ?? appId),
   );
   const reportTimeZone = await askAndSave(setupState, "reportTimezone", () =>
     askTimeZone("Report timezone", setupState.reportTimezone ?? detectedTimeZone),
@@ -118,6 +124,8 @@ async function main() {
     kvNamespaceId,
     projectName,
     appId,
+    salesAppId,
+    playerCountAppId,
     reportTimeZone,
     reportIntervalHours,
     firstReportHour,
@@ -411,6 +419,8 @@ async function saveSetupState(state) {
   const safeState = {
     projectDisplayName: state.projectDisplayName,
     steamAppId: state.steamAppId,
+    steamSalesAppId: state.steamSalesAppId,
+    steamPlayerCountAppId: state.steamPlayerCountAppId,
     reportTimezone: state.reportTimezone,
     reportIntervalHours: state.reportIntervalHours,
     firstLocalReportHour: state.firstLocalReportHour,
@@ -550,6 +560,8 @@ async function writeWranglerToml(config) {
     .replaceAll("{{KV_NAMESPACE_ID}}", config.kvNamespaceId)
     .replaceAll("{{PROJECT_DISPLAY_NAME}}", tomlString(config.projectName))
     .replaceAll("{{STEAM_APP_ID}}", tomlString(config.appId))
+    .replaceAll("{{STEAM_SALES_APP_ID}}", tomlString(config.salesAppId))
+    .replaceAll("{{STEAM_PLAYER_COUNT_APP_ID}}", tomlString(config.playerCountAppId))
     .replaceAll("{{REPORT_TIMEZONE}}", tomlString(config.reportTimeZone))
     .replaceAll("{{REPORT_INTERVAL_HOURS}}", tomlString(config.reportIntervalHours))
     .replaceAll("{{FIRST_LOCAL_REPORT_HOUR}}", tomlString(config.firstReportHour))

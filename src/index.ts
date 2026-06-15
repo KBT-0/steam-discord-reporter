@@ -1,6 +1,11 @@
 interface Env {
   PROJECT_DISPLAY_NAME?: string;
   STEAM_APP_ID: string;
+  // Optional separate app IDs. Useful when wishlists live on the main app but
+  // downloads/owners and live players are tracked on a demo or a different app.
+  // Both default to STEAM_APP_ID when unset.
+  STEAM_SALES_APP_ID?: string;
+  STEAM_PLAYER_COUNT_APP_ID?: string;
   STEAM_FINANCIAL_API_KEY: string;
   DISCORD_WEBHOOK_URL: string;
   MANUAL_RUN_TOKEN?: string;
@@ -297,6 +302,8 @@ async function runAndPost(env: Env): Promise<void> {
 
 async function buildReport(env: Env, options: RunOptions): Promise<RunReport> {
   const appId = requireEnv(env.STEAM_APP_ID, "STEAM_APP_ID");
+  const salesAppId = resolveSalesAppId(env);
+  const playerAppId = resolvePlayerCountAppId(env);
   const projectName = requireEnv(configValue(env, "PROJECT_DISPLAY_NAME", "STEAM_PROJECT_NAME"), "PROJECT_DISPLAY_NAME");
   requireEnv(env.STEAM_FINANCIAL_API_KEY, "STEAM_FINANCIAL_API_KEY");
 
@@ -332,7 +339,7 @@ async function buildReport(env: Env, options: RunOptions): Promise<RunReport> {
   }
 
   if (parseBool(env.ENABLE_SALES_REPORTING, true)) {
-    const salesResult = await buildSalesDelta(env, appId, options);
+    const salesResult = await buildSalesDelta(env, salesAppId, options);
     report.sales = salesResult.delta;
     report.owners = salesResult.owners;
     report.totals = {
@@ -347,12 +354,20 @@ async function buildReport(env: Env, options: RunOptions): Promise<RunReport> {
   }
 
   if (parseBool(env.ENABLE_PLAYER_COUNT_REPORTING, true)) {
-    const playerResult = await buildPlayerCount(env, appId, options);
+    const playerResult = await buildPlayerCount(env, playerAppId, options);
     report.players = playerResult.snapshot;
     report.notes.push(...playerResult.notes);
   }
 
   return report;
+}
+
+function resolveSalesAppId(env: Env): string {
+  return env.STEAM_SALES_APP_ID?.trim() || requireEnv(env.STEAM_APP_ID, "STEAM_APP_ID");
+}
+
+function resolvePlayerCountAppId(env: Env): string {
+  return env.STEAM_PLAYER_COUNT_APP_ID?.trim() || requireEnv(env.STEAM_APP_ID, "STEAM_APP_ID");
 }
 
 // End-of-day digest: reports a finalized Steam (UTC) reporting day in full, with country breakdowns.
@@ -371,7 +386,7 @@ async function buildDailyDigest(env: Env, options: RunOptions): Promise<RunRepor
   }
 
   if (parseBool(env.ENABLE_SALES_REPORTING, true)) {
-    report.sales = await fetchSalesSnapshotForDate(env, appId, digestDate);
+    report.sales = await fetchSalesSnapshotForDate(env, resolveSalesAppId(env), digestDate);
   }
 
   return report;
