@@ -25,7 +25,9 @@ It reports activity counts and totals only. It never posts revenue, prices, taxe
 Cloudflare Cron -> Worker -> Steamworks Financial API -> KV snapshots -> Discord
 ```
 
-Cloudflare Cron runs in UTC, so the Worker wakes every 15 minutes and checks whether the configured local report time is due. The default schedule runs hourly (`REPORT_INTERVAL_HOURS = 1`) in your chosen timezone.
+Cloudflare Cron runs in UTC, so the Worker wakes every 15 minutes and checks whether the configured local report time is due. The default schedule runs hourly (`REPORT_INTERVAL_HOURS = 1`) in your chosen timezone. For a sub-hour cadence set `REPORT_INTERVAL_MINUTES` (for example `30` for two reports per hour); it overrides `REPORT_INTERVAL_HOURS` and the effective minimum is 15 minutes. The Worker buckets the day into interval-sized windows and fires on the first cron tick of each window, so Cloudflare's sub-minute cron delivery drift never causes a missed report.
+
+Set `DISCORD_USERNAME` to control the Discord display name and footer signature (defaults to `Steam Reporter`).
 
 By default `SEND_EMPTY_REPORTS = false`, so a Discord message is sent only when there is new activity (wishlist change, a sale, a refund, or a key activation). Current player count rides along with those reports. Set `SEND_EMPTY_REPORTS = true` to post on every scheduled run.
 

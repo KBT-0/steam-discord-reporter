@@ -8,6 +8,7 @@ interface Env {
   STEAM_PLAYER_COUNT_APP_ID?: string;
   STEAM_FINANCIAL_API_KEY: string;
   DISCORD_WEBHOOK_URL: string;
+  DISCORD_USERNAME?: string;
   MANUAL_RUN_TOKEN?: string;
   ENABLE_WISHLIST_REPORTING?: string;
   ENABLE_SALES_REPORTING?: string;
@@ -19,6 +20,7 @@ interface Env {
   TOP_COUNTRY_LIMIT?: string;
   REPORT_TIMEZONE?: string;
   REPORT_INTERVAL_HOURS?: string;
+  REPORT_INTERVAL_MINUTES?: string;
   FIRST_LOCAL_REPORT_HOUR?: string;
   STEAM_REPORTER_STATE: KVNamespace;
   STEAM_PROJECT_NAME?: string;
@@ -962,8 +964,9 @@ async function postDiscordReport(env: Env, report: RunReport): Promise<void> {
       ? "Latest Steam activity counts."
       : "No new Steam activity.";
 
+  const username = configValue(env, "DISCORD_USERNAME") || "Steam Reporter";
   const body = {
-    username: "Steam Reporter",
+    username,
     allowed_mentions: { parse: [] as string[] },
     embeds: [
       {
@@ -971,6 +974,7 @@ async function postDiscordReport(env: Env, report: RunReport): Promise<void> {
         description,
         fields,
         timestamp: report.generatedAt,
+        footer: { text: username },
       },
     ],
   };
@@ -1091,6 +1095,20 @@ function parseScheduleIntervalHours(env: Env): number {
   return parseIntSafe(env.REPORT_INTERVAL_HOURS, 1);
 }
 
+// Report cadence in minutes. REPORT_INTERVAL_MINUTES wins when set; otherwise
+// falls back to REPORT_INTERVAL_HOURS * 60. The cron fires every 15 min, so the
+// effective minimum is 15.
+function parseScheduleIntervalMinutes(env: Env): number {
+  const raw = env.REPORT_INTERVAL_MINUTES;
+  if (raw != null && raw.trim() !== "") {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return parseScheduleIntervalHours(env) * 60;
+}
+
 function parseFirstReportLocalHour(env: Env): number {
   const hour = Number.parseInt(configValue(env, "FIRST_LOCAL_REPORT_HOUR", "FIRST_REPORT_LOCAL_HOUR") ?? "0", 10);
   return Number.isInteger(hour) && hour >= 0 && hour <= 23 ? hour : 0;
@@ -1103,15 +1121,19 @@ function parseDigestLocalHour(env: Env): number {
 
 // Hourly (or REPORT_INTERVAL_HOURS) incremental report. Posts only when activity changed.
 async function shouldRunIncrementalReport(env: Env, timeZone: string, local: LocalDateTimeParts): Promise<boolean> {
-  const intervalHours = parseScheduleIntervalHours(env);
+  const intervalMinutes = parseScheduleIntervalMinutes(env);
   const firstHour = parseFirstReportLocalHour(env);
 
-  if (positiveModulo(local.hour - firstHour, intervalHours) !== 0) {
-    return false;
-  }
+  // Split the day into interval-sized windows ("buckets"). Cron delivery drifts
+  // within the minute, so we never test an exact minute; whichever tick lands
+  // first in a bucket runs it, and the slot dedup keeps later ticks in the same
+  // bucket quiet. With a 30-minute interval this yields two reports per hour.
+  const minutesOfDay = local.hour * 60 + local.minute;
+  const offsetMinutes = firstHour * 60;
+  const bucket = Math.floor(positiveModulo(minutesOfDay - offsetMinutes, 1440) / intervalMinutes);
 
-  const slotKey = `schedule:last_slot:${timeZone}:${intervalHours}:${firstHour}`;
-  const slotValue = `${local.year}-${pad2(local.month)}-${pad2(local.day)}-${pad2(local.hour)}`;
+  const slotKey = `schedule:last_slot:${timeZone}:${intervalMinutes}:${firstHour}`;
+  const slotValue = `${local.year}-${pad2(local.month)}-${pad2(local.day)}-${bucket}`;
   if ((await env.STEAM_REPORTER_STATE.get(slotKey)) === slotValue) {
     return false;
   }

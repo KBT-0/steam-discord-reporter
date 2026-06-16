@@ -12,6 +12,8 @@ enabled = true
 
 [vars]
 PROJECT_DISPLAY_NAME = {{PROJECT_DISPLAY_NAME}}
+# Optional: Discord display name + footer signature. Defaults to "Steam Reporter".
+# DISCORD_USERNAME = "Your Steam Reporter"
 STEAM_APP_ID = {{STEAM_APP_ID}}
 # Sales/owners and live player count can point at a different app (e.g. a demo).
 # Leave equal to STEAM_APP_ID for a single-app setup.
@@ -27,6 +29,9 @@ BASELINE_SALES_ON_FIRST_RUN = "true"
 TOP_COUNTRY_LIMIT = {{TOP_COUNTRY_LIMIT}}
 REPORT_TIMEZONE = {{REPORT_TIMEZONE}}
 REPORT_INTERVAL_HOURS = {{REPORT_INTERVAL_HOURS}}
+# Optional: sub-hour cadence in minutes. Overrides REPORT_INTERVAL_HOURS when set.
+# The cron fires every 15 min, so the effective minimum is 15. Example: "30".
+# REPORT_INTERVAL_MINUTES = "30"
 FIRST_LOCAL_REPORT_HOUR = {{FIRST_LOCAL_REPORT_HOUR}}
 
 [[kv_namespaces]]
