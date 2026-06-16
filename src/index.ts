@@ -266,11 +266,10 @@ async function runScheduled(env: Env): Promise<void> {
   const timeZone = resolveReportTimeZone(env);
   const local = getLocalDateTimeParts(new Date(), timeZone);
 
-  // Cron fires every 15 minutes; only the top of the hour is a candidate report slot.
-  if (local.minute !== 0) {
-    return;
-  }
-
+  // Cron fires every 15 minutes, but Cloudflare's delivery time drifts within the
+  // minute (observed scheduledTime e.g. HH:15:59), so we must NOT require an exact
+  // minute === 0. The per-hour / per-day dedup slots inside the checks below ensure
+  // each report still fires exactly once, on the first tick of its target hour/day.
   if (await shouldRunIncrementalReport(env, timeZone, local)) {
     await runAndPost(env);
   }
